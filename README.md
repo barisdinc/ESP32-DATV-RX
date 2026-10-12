@@ -155,6 +155,8 @@ need 1.0 MB/s.
 
 ## Credits and licences
 
+The code of this repository (`rx_dvbs2.py`, `tools/`, documentation) is under the
+[BSD 3-Clause licence](LICENSE).
 The receive path is built on [eSpDR](https://github.com/h0m3us3r/eSpDR) (h0m3us3r) and
 [esp32-sdr-trx](https://github.com/jochenhammes/esp32-sdr-trx) (Jochen Hammes), both 0BSD. The firmware files in
 the release are unchanged from esp32-sdr-trx v1.0.0-rc4 (its `LICENSE` and `NOTICE` are included). The receiver
@@ -252,5 +254,6 @@ toplamı) ve 110 çerçeveden 109'unu çözdü.
 - **333 kS/s:** ≈ 450 kHz yer kaplıyor, alıcı ise en fazla ±133 kHz görüyor (sınırı USB Full-Speed koyuyor). Bir
   sonraki adım alıcı firmware'ine 4 bit I/Q "geniş mod" eklemek.
 
-Lisanslar ve teşekkürler için yukarıdaki *Credits and licences* bölümüne bakın. Yayın yapmak için amatör telsiz
+Bu reponun kodu [BSD 3-Clause lisansı](LICENSE) ile yayınlanıyor. Kullanılan diğer projelerin lisansları ve
+teşekkürler için yukarıdaki *Credits and licences* bölümüne bakın. Yayın yapmak için amatör telsiz
 lisansı gerekir.
