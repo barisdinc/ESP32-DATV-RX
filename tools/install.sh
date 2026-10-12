@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install what rx_dvbs2.py needs, inside this folder:
-#   .venv/                 Python venv with espdr-rx (esp32-sdr-trx, which carries the receiver firmware) and numpy
+#   .venv/                 Python venv with espdr-rx and espdr.nb (firmware/*.whl, which carries the receiver firmware) and numpy
 #   build/leansdr/         leandvb from leansdr (work branch, DVB-S2 enabled)
 # System packages it expects: python3 python3-venv git g++ make ffmpeg
 #   sudo apt install python3 python3-venv git g++ make ffmpeg
@@ -8,9 +8,7 @@ set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-ESPDR_VERSION=1.0.0-rc4
-ESPDR_WHEEL=esp32_sdr_trx-1.0.0rc4-py3-none-any.whl
-ESPDR_URL=https://github.com/jochenhammes/esp32-sdr-trx/releases/download/v$ESPDR_VERSION/$ESPDR_WHEEL
+ESPDR_WHEEL=firmware/esp32_sdr_trx-1.0.0rc4+cs4-py3-none-any.whl   # esp32-sdr-trx with cs4, see esp32-sdr-trx/
 LEANSDR_URL=https://github.com/pabr/leansdr.git
 LEANSDR_COMMIT=84c59e1c7a1a79338d5722d63f28640cc9d350f3   # branch "work", DVB-S2 receiver
 
@@ -18,15 +16,13 @@ for t in python3 git g++ make ffmpeg ffplay; do
   command -v $t >/dev/null || { echo "missing: $t  (sudo apt install python3 python3-venv git g++ make ffmpeg)"; exit 1; }
 done
 
-echo "== Python venv and espdr-rx $ESPDR_VERSION"
+echo "== Python venv and espdr ($ESPDR_WHEEL)"
+[ -f "$ESPDR_WHEEL" ] || { echo "missing $ESPDR_WHEEL"; exit 1; }
 [ -x .venv/bin/python ] || python3 -m venv .venv
-if [ -f "firmware/$ESPDR_WHEEL" ]; then
-  WHEEL="firmware/$ESPDR_WHEEL"            # the release ZIP carries the wheel
-else
-  WHEEL="$ESPDR_URL"
-fi
 .venv/bin/pip install -q --upgrade pip
-.venv/bin/pip install -q "$WHEEL" numpy
+.venv/bin/pip install -q "$ESPDR_WHEEL"                                # with its dependencies
+.venv/bin/pip install -q --force-reinstall --no-deps "$ESPDR_WHEEL"   # replaces an upstream esp32-sdr-trx
+.venv/bin/pip install -q numpy
 
 echo "== leandvb (leansdr $LEANSDR_COMMIT)"
 if [ ! -d build/leansdr/.git ]; then

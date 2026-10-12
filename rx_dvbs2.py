@@ -2,14 +2,19 @@
 """rx_dvbs2.py: receive a DVB-S2 transmission with an ESP32-S3 and show it.
 
     ESP32-S3 (espdr-rx, rtl_tcp, 333 ksps) -> leandvb (DVB-S2) -> ffmpeg (retime) -> ffplay
+    ESP32-S3 (--wide: espdr.nb, packed 4-bit I/Q, 500 ksps) -> leandvb -> ffmpeg -> ffplay
 
 It starts espdr-rx when no rtl_tcp server is listening (espdr-rx loads the receiver firmware into the
 board's RAM when needed), looks for the signal near the given frequency, tunes to its centre and plays
 the transport stream. Ctrl-C or closing the video window ends it.
+
+--wide receives up to about 333 kS/s. It needs the receiver firmware with the cs4 format (esp32-sdr-trx
+1.0.0rc4+cs4, installed by tools/install.sh); 333 ksps int8 through rtl_tcp is limited to about 200 kS/s.
 """
 import argparse
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -17,7 +22,10 @@ import sys
 import threading
 import time
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # main() re-executes inside .venv
+    np = None
 
 
 def log(*a):
@@ -25,6 +33,7 @@ def log(*a):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FS = 333333  # espdr-rx --decim 3
+FS_WIDE = 500000  # espdr.nb --decim 2 --format cs4
 
 
 def find_tool(name, *candidates):
@@ -69,6 +78,103 @@ class RtlTcp:
         self.s.close()
 
 
+class NarrowSource:
+    """espdr-rx's rtl_tcp server: 333 ksps cu8."""
+
+    fs = FS
+
+    def __init__(self, args):
+        self.args = args
+
+    def grab(self, freq, seconds):
+        rx = RtlTcp(self.args.host, self.args.port)
+        rx.setup(freq, self.args.gain)
+        rx.read(int(0.3 * FS) * 2)  # retune settling
+        b = np.frombuffer(rx.read(int(seconds * FS) * 2), np.uint8).astype(np.float32) - 127.5
+        rx.close()
+        return b[0::2] + 1j * b[1::2]
+
+    def leandvb_input(self):
+        return ["--u8", "-f", str(FS)]
+
+    def start(self, freq, sink):
+        """Streams to sink.write() from a thread until the server closes or sink fails."""
+        def pump():
+            rx = RtlTcp(self.args.host, self.args.port)
+            rx.setup(freq, self.args.gain)
+            try:
+                while d := rx.s.recv(65536):
+                    sink.write(d)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                rx.close()
+        threading.Thread(target=pump, daemon=True).start()
+
+    def stop(self):
+        pass
+
+
+class WideSource:
+    """espdr.nb directly: 500 ksps packed 4-bit I/Q with a gain per packet, delivered as cf32."""
+
+    fs = FS_WIDE
+
+    def __init__(self, args):
+        self.args = args
+        self.proc = None
+        try:
+            from espdr import board, nb
+        except ImportError:
+            sys.exit("espdr not found: run tools/install.sh first (or activate the venv)")
+        if "cs4" not in nb.FORMATS:
+            sys.exit("the installed espdr has no cs4 format: run tools/install.sh again (it installs esp32-sdr-trx 1.0.0rc4+cs4)")
+        self.port = board.ensure(board.RX, log=log)  # loads the receiver firmware into RAM if needed
+        link = nb.open_link(self.port)
+        status, _ = link.command(nb.NB_SET_FORMAT, nb.FORMATS["cs4"], allow=(0, 2))
+        link.ser.close()
+        if status != 0:
+            log("the running firmware has no cs4 format; loading the one of the installed package")
+            self.port = board.ensure(board.RX, load="always", log=log)
+        # espdr-rx maps 0..49.6 dB to the gain selector 30..80
+        self.selector = round(30 + max(0.0, min(49.6, args.gain)) * 50 / 49.6)
+
+    def _cmd(self, freq, seconds):
+        return [sys.executable, "-m", "espdr.nb", "-p", self.port, "run", "--freq", str(round(freq)), "--decim", "2",
+                "--format", "cs4", "--gain", str(self.selector), "--seconds", str(seconds), "--convert", "cf32", "-o", "-"]
+
+    def grab(self, freq, seconds):
+        p = subprocess.run(self._cmd(freq, int(seconds) + 1), capture_output=True, timeout=30)
+        if p.returncode:
+            sys.exit("espdr.nb failed:\n" + p.stderr.decode(errors="ignore"))
+        x = np.frombuffer(p.stdout, np.complex64)
+        return x[int(0.3 * FS_WIDE):]
+
+    def leandvb_input(self):
+        # cf32 in full-scale units (about 0.02 RMS at the usual gain); leandvb's AGC does the rest
+        return ["--f32", "--float-scale", "512", "-f", str(FS_WIDE)]
+
+    def start(self, freq, sink):
+        self.proc = subprocess.Popen(self._cmd(freq, 0), stdout=subprocess.PIPE,
+                                     stderr=None if self.args.verbose else subprocess.DEVNULL)
+
+        def pump():
+            try:
+                while d := self.proc.stdout.read1(65536):
+                    sink.write(d)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        threading.Thread(target=pump, daemon=True).start()
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)  # espdr.nb stops the ESP's run cleanly on SIGINT
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 def server_up(host, port):
     try:
         socket.create_connection((host, port), timeout=1).close()
@@ -98,20 +204,16 @@ def start_espdr(args):
     sys.exit("espdr-rx did not start within 60 s")
 
 
-def search(args, freq):
-    """Find the signal within +-120 kHz of freq; return its centre frequency in Hz."""
-    rx = RtlTcp(args.host, args.port)
-    rx.setup(freq, args.gain)
-    rx.read(int(0.3 * FS) * 2)  # retune settling
-    b = np.frombuffer(rx.read(FS * 2), np.uint8).astype(np.float32) - 127.5
-    rx.close()
-    x = b[0::2] + 1j * b[1::2]
+def search(src, freq):
+    """Find the signal near freq; return its centre frequency in Hz."""
+    fs = src.fs
+    x = src.grab(freq, 1.0)
     n = 1024
     seg = len(x) // n
     p = np.mean(np.abs(np.fft.fftshift(np.fft.fft(x[: seg * n].reshape(seg, n) * np.hanning(n), axis=1), axes=1)) ** 2, 0)
     p = np.convolve(10 * np.log10(p + 1e-9), np.ones(9) / 9, "same")
-    f = (np.arange(n) - n / 2) * FS / n
-    usable = np.abs(f) < 150e3
+    f = (np.arange(n) - n / 2) * fs / n
+    usable = np.abs(f) < 0.45 * fs
     floor = np.percentile(p[usable], 10)
     peak = np.percentile(p[usable], 95)
     if peak - floor < 6:
@@ -122,15 +224,22 @@ def search(args, freq):
     centre = freq + (lo + hi) / 2
     log(f"search: signal {peak - floor:.0f} dB above the floor, -3 dB width {(hi - lo) / 1e3:.0f} kHz, "
           f"centre {centre / 1e6:.4f} MHz ({(centre - freq) / 1e3:+.1f} kHz)")
-    if hi - lo > 0.9 * 2 * 133e3:
-        log("search: the signal is wider than the receiver (+-133 kHz): set the transmitter to 125 kS/s")
+    if hi - lo > 0.8 * fs:
+        log(f"search: the signal is wider than the receiver ({fs / 1e3:.0f} ksps)"
+            + ("" if src.fs == FS_WIDE else ": use --wide, or set the transmitter to 125 kS/s"))
     return centre
 
 
 def main():
+    # Run inside the project's venv (numpy, espdr) when started as ./rx_dvbs2.py with the system Python.
+    venv_python = os.path.join(HERE, ".venv", "bin", "python")
+    if os.path.exists(venv_python) and os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(HERE, ".venv")):
+        os.execv(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--freq", type=float, default=2300.5, help="transmitter frequency in MHz (default 2300.5)")
-    ap.add_argument("--sr", type=float, default=125e3, help="symbol rate in S/s (default 125000; at most about 200000)")
+    ap.add_argument("--sr", type=float, default=125e3,
+                    help="symbol rate in S/s (default 125000; at most about 200000, with --wide about 333000)")
+    ap.add_argument("--wide", action="store_true", help="500 ksps 4-bit mode for symbol rates above 200 kS/s")
     ap.add_argument("--cr", default="3/4", help="code rate (default 3/4)")
     ap.add_argument("--const", default="QPSK", help="constellation (default QPSK)")
     ap.add_argument("--gain", type=float, default=10, help="receiver gain in dB, 0..49.6 (default 10)")
@@ -151,21 +260,28 @@ def main():
     if not args.no_play and not (shutil.which("ffmpeg") and shutil.which("ffplay")):
         sys.exit("ffmpeg/ffplay not found: sudo apt install ffmpeg")
 
-    espdr = None if server_up(args.host, args.port) else start_espdr(args)
+    espdr = None
+    if args.wide:
+        if server_up(args.host, args.port):
+            sys.exit("an rtl_tcp server (espdr-rx) is running and holds the board: stop it for --wide")
+        src = WideSource(args)
+    else:
+        espdr = None if server_up(args.host, args.port) else start_espdr(args)
+        src = NarrowSource(args)
     procs = []
     try:
         freq = args.freq * 1e6
         if not args.no_search:
             # A signal far off centre is cut by the +-166 kHz window: retune to the estimate and look again.
             for _ in range(3):
-                found = search(args, freq)
+                found = search(src, freq)
                 if found is None:
                     break
                 step, freq = found - freq, found
                 if abs(step) < 5e3:
                     break
 
-        dvb = subprocess.Popen([leandvb, "--u8", "-f", str(FS), "--sr", str(int(args.sr)), "--standard", "DVB-S2",
+        dvb = subprocess.Popen([leandvb] + src.leandvb_input() + ["--sr", str(int(args.sr)), "--standard", "DVB-S2",
                                 "--const", args.const, "--cr", args.cr, "--ldpc-bf", "100", "--fastdrift", "-d"],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         procs.append(dvb)
@@ -190,17 +306,6 @@ def main():
 
         stats = {"good": 0, "bad": 0, "locks": 0, "ts": 0}
 
-        def pump_iq():
-            rx = RtlTcp(args.host, args.port)
-            rx.setup(freq, args.gain)
-            try:
-                while d := rx.s.recv(65536):
-                    dvb.stdin.write(d)
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-            finally:
-                rx.close()
-
         def pump_ts():
             while d := dvb.stdout.read1(65536):
                 stats["ts"] += len(d) // 188
@@ -221,7 +326,8 @@ def main():
                 if args.verbose:
                     sys.stderr.write(t)
 
-        for fn in (pump_iq, pump_ts, pump_log):
+        src.start(freq, dvb.stdin)
+        for fn in (pump_ts, pump_log):
             threading.Thread(target=fn, daemon=True).start()
 
         log(f"receiving {freq / 1e6:.4f} MHz, {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB. "
@@ -245,6 +351,14 @@ def main():
                 p.wait(3)
             except subprocess.TimeoutExpired:
                 p.kill()
+        src.stop()
+        for p in procs:
+            for f in (p.stdin, p.stdout):
+                try:
+                    if f:
+                        f.close()
+                except OSError:  # its reader or writer is gone already
+                    pass
         if espdr:
             espdr.terminate()
             espdr.wait(10)

@@ -1,0 +1,288 @@
+diff --git a/firmware/protocol/narrowband.h b/firmware/protocol/narrowband.h
+index 66ee325..24f2d7e 100644
+--- a/firmware/protocol/narrowband.h
++++ b/firmware/protocol/narrowband.h
+@@ -13,10 +13,15 @@
+  *   hw3  dropped: units lost to a full FIFO so far (saturating u16)
+  *   hw4-5 seq: unit sequence number (u32)
+  *   hw6-7 first: output sample index of the first sample (u32, wraps)
+- *   hw8  output shift | 0 << 8
++ *   hw8  output shift | gain << 8 (gain: cs4 only, see below)
+  *   hw9  checksum: the 16-bit sum of all ten halfwords is 0xFFFF
+- *   payload: count x (I, Q), int16 LE (cs16) or int8 (cs8)
++ *   payload: count x (I, Q), int16 LE (cs16) or int8 (cs8); cs4: count bytes, I in bits 0..3 and Q in bits 4..7
+  * Output rate = 16 MHz / 16 / R2. A gap in `first` marks lost samples.
++ *
++ * cs4 (packed 4-bit I/Q with a gain per packet, for 500 ksps within the USB limit): the packet's cs16 samples
++ * (output shift ignored), minus a running DC estimate, are multiplied by g = NB_CS4_MANT[j] / 2^(8 + e), chosen per packet so that the mean
++ * |I|,|Q| is just below NB_CS4_TARGET/100 LSB, then floored to -8..7. The gain byte is e | j << 4. The host
++ * reconstructs a cs16 sample as (v + 0.5) / g.
+  */
+ #ifndef IQSTREAM_NARROWBAND_H
+ #define IQSTREAM_NARROWBAND_H
+@@ -26,6 +31,13 @@
+ #define NB_HEADER_BYTES 20
+ #define NB_FORMAT_CS16 0
+ #define NB_FORMAT_CS8 1
++#define NB_FORMAT_CS4 2
++
++/* cs4 gain: mantissas 256 * 2^(j/8), j = 0..7 (0.75 dB steps), and the target mean |x| in LSB/100 (2.79 LSB
++ * mean |x| is about 3.5 LSB RMS for Gaussian samples, the best 4-bit scale found in tools/sim_wide.py). */
++#define NB_CS4_MANT {256, 279, 304, 332, 362, 395, 431, 470}
++#define NB_CS4_TARGET 279u
++#define NB_CS4_MAX_E 15u
+ 
+ #define NB_SET_DECIM 29    /* R2: 2 (500 ksps), 3 (333 ksps) or 4 (250 ksps) */
+ #define NB_SET_FORMAT 30   /* NB_FORMAT_* */
+diff --git a/firmware/src/dsp.c b/firmware/src/dsp.c
+index e20f68b..e3eaf3a 100644
+--- a/firmware/src/dsp.c
++++ b/firmware/src/dsp.c
+@@ -40,6 +40,8 @@ extern volatile uint32_t dsp_scalar_only;
+ #define HIST 128u    /* stage-1 history ring, power of two >= longest FIR */
+ #define CIC_SHIFT 11 /* CIC gain 2^16, 10-bit input: full scale -> +-2^14 */
+ #define IDLE_BLOCKS 32u
++#define DSP_FORMAT_CS8 1u /* NB_FORMAT_* of protocol/narrowband.h */
++#define DSP_FORMAT_CS4 2u
+ 
+ #ifndef DSP_FUNC
+ #define DSP_FUNC dsp_unit
+@@ -277,11 +279,11 @@ unsigned DSP_ATTR DSP_FUNC(const dsp_config *cfg, const uint32_t *cur, const uin
+         const int32_t accI = acc[0], accQ = acc[1];
+         int32_t yi = (accI + (1 << 14)) >> 15;
+         int32_t yq = (accQ + (1 << 14)) >> 15;
+-        if (shift) {
++        if (shift && cfg->format != DSP_FORMAT_CS4) {
+             yi = (yi + (1 << (shift - 1))) >> shift;
+             yq = (yq + (1 << (shift - 1))) >> shift;
+         }
+-        if (cfg->format == 0) {
++        if (cfg->format != DSP_FORMAT_CS8) { /* cs16, and cs4 before stream.c packs it */
+             yi = clamp(yi, -32768, 32767);
+             yq = clamp(yq, -32768, 32767);
+             uint8_t *o = out + produced * 4;
+diff --git a/firmware/src/dsp.h b/firmware/src/dsp.h
+index d52ac3a..d54dcc6 100644
+--- a/firmware/src/dsp.h
++++ b/firmware/src/dsp.h
+@@ -9,7 +9,7 @@
+ 
+ typedef struct {
+     unsigned r2;     /* 2, 3 or 4 */
+-    unsigned format; /* 0: int16 I,Q   1: int8 I,Q */
++    unsigned format; /* 0: int16 I,Q   1: int8 I,Q   2: int16 I,Q that stream.c packs to cs4 */
+     unsigned shift;  /* extra right shift of the output */
+ } dsp_config;
+ 
+diff --git a/firmware/src/stream.c b/firmware/src/stream.c
+index 1ce6417..fd92bc6 100644
+--- a/firmware/src/stream.c
++++ b/firmware/src/stream.c
+@@ -39,6 +39,13 @@ static struct {
+ volatile uint32_t stream_slips; /* unit joins accepted with a small slip, see capture.c */
+ volatile uint32_t stream_abort; /* set by capture.c when a run has failed */
+ 
++/* DC estimate for cs4, in 1/16 LSB of the cs16 samples: a first-order filter over the packets' means, updated in
++ * packet order (in unit_body's commit turn). The radio's DC offset can be half the signal's RMS, which would waste
++ * most of the 4-bit range. */
++static volatile int32_t cs4_dc[2];
++static volatile uint32_t cs4_dc_valid;
++#define CS4_DC_SHIFT 3 /* time constant of 8 packets (8 ms) */
++
+ void stream_begin(void)
+ {
+     q.head_total = q.tail_total = 0;
+@@ -48,6 +55,8 @@ void stream_begin(void)
+     q.fifo_peak = 0;
+     stream_abort = 0;
+     stream_slips = 0;
++    cs4_dc[0] = cs4_dc[1] = 0;
++    cs4_dc_valid = 0;
+     memory_barrier();
+ }
+ 
+@@ -71,7 +80,7 @@ unsigned stream_set(unsigned op, uint32_t value, uint32_t *effective)
+         *effective = stream_cfg.r2;
+         return CTL_OK;
+     case NB_SET_FORMAT:
+-        if (value > NB_FORMAT_CS8)
++        if (value > NB_FORMAT_CS4)
+             return CTL_BAD_ARGUMENT;
+         stream_cfg.format = value;
+         *effective = stream_cfg.format;
+@@ -193,6 +202,73 @@ static inline __attribute__((always_inline)) void put32(uint8_t *p, uint32_t v)
+     put16(p + 2, v >> 16);
+ }
+ 
++static const uint16_t cs4_mant[8] = NB_CS4_MANT;
++
++/* num / den by shift and subtract: core 1 must not call the ROM's division helpers. */
++static inline __attribute__((always_inline)) uint32_t udiv32(uint32_t num, uint32_t den)
++{
++    uint32_t quo = 0;
++    for (int b = 31; b >= 0; b--) {
++        if ((num >> b) >= den) {
++            num -= den << b;
++            quo |= 1u << b;
++        }
++    }
++    return quo;
++}
++
++static inline __attribute__((always_inline)) int32_t sdiv32(int32_t num, uint32_t den)
++{
++    return num < 0 ? -(int32_t)udiv32((uint32_t)-num, den) : (int32_t)udiv32((uint32_t)num, den);
++}
++
++/*
++ * Packs the packet's n cs16 samples at p into n cs4 bytes in place (byte k is written after sample k is read, and
++ * k <= 4k), after removing the DC estimate. Returns the gain byte for the header (see narrowband.h) and the packet's
++ * mean I and Q (1/16 LSB) in mean[]. Inlined into both cores' unit_body: no ROM calls, so no division and no 64-bit
++ * arithmetic.
++ */
++static inline __attribute__((always_inline)) unsigned pack_cs4(uint8_t *p, unsigned n, int32_t *mean)
++{
++    const int32_t di = (cs4_dc[0] + 8) >> 4, dq = (cs4_dc[1] + 8) >> 4;
++    int32_t si = 0, sq = 0;  /* signed sums: at most DSP_MAX_OUTPUTS * 32768 = 2^24 */
++    uint32_t sum = 0;        /* sum of |I - dc| + |Q - dc|: at most 2 * 512 * 65535 < 2^26 */
++    for (unsigned k = 0; k < n; k++) {
++        int32_t i = (int16_t)(p[4 * k] | p[4 * k + 1] << 8), q = (int16_t)(p[4 * k + 2] | p[4 * k + 3] << 8);
++        si += i;
++        sq += q;
++        i -= di;
++        q -= dq;
++        sum += (uint32_t)(i < 0 ? -i : i) + (uint32_t)(q < 0 ? -q : q);
++    }
++    mean[0] = mean[1] = 0;
++    /* The largest gain g = M[j] / 2^(8+e) with g * mean|x| <= TARGET/100 LSB. mean|x| * 100 = sum * 50 / n
++     * (sum * 50 < 2^32); the comparison drops 8 bits on the left so nothing overflows. */
++    unsigned e = 0, j = 7;
++    if (n) {
++        mean[0] = sdiv32(si * 16, n);
++        mean[1] = sdiv32(sq * 16, n);
++        const uint32_t mean100 = udiv32(sum * 50u, n);
++        for (e = 0; e < NB_CS4_MAX_E; e++) {
++            for (j = 8; j-- > 0;)
++                if (((uint32_t)cs4_mant[j] * mean100) >> 8 <= (NB_CS4_TARGET << e))
++                    goto found;
++        }
++        j = 0;
++    found:;
++    }
++    const int32_t m = cs4_mant[j];
++    const unsigned sh = 8 + e;
++    for (unsigned k = 0; k < n; k++) {
++        int32_t i = (int16_t)(p[4 * k] | p[4 * k + 1] << 8) - di, q = (int16_t)(p[4 * k + 2] | p[4 * k + 3] << 8) - dq;
++        int32_t vi = (i * m) >> sh, vq = (q * m) >> sh; /* floor: the host adds 0.5 */
++        vi = vi < -8 ? -8 : vi > 7 ? 7 : vi;
++        vq = vq < -8 ? -8 : vq > 7 ? 7 : vq;
++        p[k] = (uint8_t)((vi & 15) | (vq & 15) << 4);
++    }
++    return e | j << 4;
++}
++
+ /*
+  * Body of stream_unit() and stream_unit_core1(), inlined into both so core 1
+  * runs its copy from its own instruction bank and never fetches from core 0's.
+@@ -207,7 +283,11 @@ static inline __attribute__((always_inline)) void unit_body(const unsigned core1
+     void (*idle)(void) = core1 ? 0 : stream_pump;
+     unsigned n = (core1 ? dsp_unit_core1 : dsp_unit)(&stream_cfg, cur, prev, first, count, start,
+                                                      sequence != 0, buf + HEADER, idle);
+-    unsigned bytes_per = stream_cfg.format == NB_FORMAT_CS16 ? 4 : 2;
++    unsigned gain = 0;
++    int32_t mean[2] = {0, 0};
++    if (stream_cfg.format == NB_FORMAT_CS4)
++        gain = pack_cs4(buf + HEADER, n, mean);
++    unsigned bytes_per = stream_cfg.format == NB_FORMAT_CS16 ? 4 : stream_cfg.format == NB_FORMAT_CS8 ? 2 : 1;
+     unsigned payload = n * bytes_per;
+     unsigned total = HEADER + payload;
+ 
+@@ -219,6 +299,17 @@ static inline __attribute__((always_inline)) void unit_body(const unsigned core1
+     if (stream_abort)
+         return;
+ 
++    if (stream_cfg.format == NB_FORMAT_CS4 && n) { /* in packet order: update the DC estimate */
++        if (!cs4_dc_valid) {
++            cs4_dc[0] = mean[0];
++            cs4_dc[1] = mean[1];
++            cs4_dc_valid = 1;
++        } else {
++            cs4_dc[0] += (mean[0] - cs4_dc[0]) >> CS4_DC_SHIFT;
++            cs4_dc[1] += (mean[1] - cs4_dc[1]) >> CS4_DC_SHIFT;
++        }
++    }
++
+     uint32_t dropped = q.dropped_units;
+     buf[0] = NB_MAGIC0;
+     buf[1] = NB_MAGIC1;
+@@ -227,7 +318,7 @@ static inline __attribute__((always_inline)) void unit_body(const unsigned core1
+     put16(buf + 6, dropped > 0xFFFF ? 0xFFFF : dropped);
+     put32(buf + 8, sequence);
+     put32(buf + 12, out_start);
+-    put16(buf + 16, stream_cfg.shift);
++    put16(buf + 16, stream_cfg.shift | gain << 8);
+     uint32_t sum = 0;
+     for (unsigned i = 0; i < HEADER - 2; i += 2)
+         sum += buf[i] | (buf[i + 1] << 8);
+diff --git a/pyproject.toml b/pyproject.toml
+index fbb44b6..1162843 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "esp32-sdr-trx"
+-version = "0.0.0.dev0"
++version = "1.0.0rc4+cs4"
+ description = "A software-defined transceiver from one ESP32-S3 board: an rtl_tcp receiver for SDR++ and an FM/SSB voice and RTTY transmitter for 13 cm"
+ readme = "README.md"
+ license = { text = "0BSD" }
+diff --git a/src/espdr/nb.py b/src/espdr/nb.py
+index fdb3fda..49250d5 100644
+--- a/src/espdr/nb.py
++++ b/src/espdr/nb.py
+@@ -43,8 +43,24 @@ FAIL_NAMES = {1: "bank ownership changed", 2: "late poll", 3: "late switch", 4:
+               8: "next bank prepared too late (DSP too slow)", 9: "radio init failed"}
+ NB_MAGIC = b"\xE5\x5D"
+ NB_HEADER = 20
+-FORMATS = {"cs16": 0, "cs8": 1}
+-BYTES_PER_SAMPLE = {0: 4, 1: 2}
++FORMATS = {"cs16": 0, "cs8": 1, "cs4": 2}
++BYTES_PER_SAMPLE = {0: 4, 1: 2, 2: 1}
++CS4_MANT = (256, 279, 304, 332, 362, 395, 431, 470)  # NB_CS4_MANT in protocol/narrowband.h
++
++
++def cs4_gain(shift_word):
++    """The gain g of a cs4 packet from header word 8: sample (cs16 units) = (v + 0.5) / g."""
++    gb = shift_word >> 8
++    return CS4_MANT[(gb >> 4) & 7] / float(1 << (8 + (gb & 15)))
++
++
++def unpack_cs4(payload, shift_word, np):
++    """cs4 payload -> interleaved float32 I, Q in cs16 units."""
++    b = np.frombuffer(payload, dtype=np.uint8)
++    v = np.empty(2 * len(b), dtype=np.int8)
++    v[0::2] = (b << 4).astype(np.int8) >> 4  # I: bits 0..3, sign-extended
++    v[1::2] = b.astype(np.int8) >> 4         # Q: bits 4..7
++    return (v.astype(np.float32) + 0.5) / cs4_gain(shift_word)
+ SERVICE_BUDGET_CYCLES = 2 * 240_000  # two unit periods of ~1 ms at 240 MHz: what one lane may take
+ 
+ 
+@@ -255,6 +271,8 @@ class Output:
+         np = self.np
+         if header["format"] == 0:
+             a = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
++        elif header["format"] == 2:
++            a = unpack_cs4(payload, header["shift"], np) / 32768.0
+         else:
+             a = np.frombuffer(payload, dtype=np.int8).astype(np.float32) / 128.0
+         if self.flip:
+@@ -336,6 +354,8 @@ def cmd_run(args):
+     link = open_link(args.port)
+     check_firmware(link)
+     fmt = FORMATS[args.format]
++    if fmt == 2 and args.convert != "cf32" and (args.out or args.tcp or args.udp):
++        raise ProtocolError("cs4 carries a gain per packet: use --convert cf32")
+     shift = args.shift if args.shift is not None else (4 if fmt == 1 else 0)
+     lo = configure_receiver(link, args.freq, args.decim, fmt, shift, args.gain)
+     rate = 1e6 / args.decim
