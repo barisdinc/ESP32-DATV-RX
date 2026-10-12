@@ -49,8 +49,9 @@ it, or clone this repository. Then, in its folder:
 tools/install.sh
 ```
 
-This creates `.venv/` with `espdr-rx` and `espdr.nb` from `firmware/*.whl` (it carries the receiver firmware) and builds `leandvb` into
-`build/leansdr/`, which takes about a minute. Nothing is installed system-wide. Once, optionally, install the udev
+This creates `.venv/` with `espdr-rx` and `espdr.nb` from `firmware/*.whl` (it carries the receiver firmware), builds
+`leandvb` into `build/leansdr/` and the soft-decision LDPC decoder `ldpc_tool` into `build/LDPC/`, which takes a minute
+or two. Nothing is installed system-wide. Once, optionally, install the udev
 rule that the script prints. It keeps ModemManager away from the board and lets you use it without the `dialout` group.
 
 ## Loading the receiver firmware into the ESP32-S3
@@ -111,6 +112,7 @@ without errors. Ctrl-C or closing the window ends it.
 | `--no-search` | | tune exactly to `--freq` |
 | `--record FILE.ts` | | also save the transport stream |
 | `--no-play`, `--stdout` | | no window; TS to stdout (for VLC, ffmpeg, ...) |
+| `--ldpc` | auto | `tool`: ldpc_tool (soft decision), `bitflip`: leandvb's own decoder; auto takes ldpc_tool if built |
 | `-v` | | show leandvb's messages |
 
 Examples from the bench: `./rx_dvbs2.py --freq 2301.5` found the transmitter at 2301.385 MHz (−115 kHz, the
@@ -124,9 +126,13 @@ packets per second).
   level fades (people moving, multipath on the bench), raise the gain a little rather than lower it, because weak
   int8 samples lose resolution.
 - **Frequency offset:** the search covers up to about ±200 kHz. Beyond that, give a closer `--freq` or use `--ppm`.
+- **LDPC:** `rx_dvbs2.py` runs [ldpc_tool](https://github.com/Blockstream/LDPC) as leandvb's LDPC helper. In an offline
+  test (`tools/sim_wide.py --realtime`) it decoded down to Es/N0 ≈ 8 dB where leandvb's bit-flip decoder needed 13 to
+  14 dB: about **5 dB** more margin. It decodes 32 frames at a time, so the picture comes about 3 s (333 kS/s) or 9 s
+  (125 kS/s) late. Below about 8 dB leandvb's carrier and frame lock, not the LDPC, is the limit.
 - **Margin at 333 kS/s:** the same power spreads over 2.7 times the bandwidth, so the signal stands only about 11 to
-  14 dB above the floor where 125 kS/s showed 25 to 30 dB. leandvb's bit-flip LDPC needs about 12 to 14 dB, so keep
-  the antennas close; the soft-decision decoder on the roadmap would gain about 9 dB.
+  14 dB above the floor where 125 kS/s showed 25 to 30 dB. With ldpc_tool that leaves a few dB; keep the antennas
+  close.
 - **`--wide` and espdr-rx:** both use the board's native port. Stop a running `espdr-rx` before `--wide`.
 - **"X Error ... GLX" in ffplay:** `rx_dvbs2.py` sets `SDL_VIDEO_X11_FORCE_EGL=1`, which avoids it. Do the same
   when you start ffplay yourself.
@@ -155,7 +161,7 @@ gain, 4-bit quantisation costs about 0.07 dB at Es/N0 = 5 dB and 0.5 dB at 14 dB
 1. ~~Proof of concept: esp32-sdr-trx + leandvb, transmitter at 125 kS/s.~~ Done.
 2. ~~One-command receiver `rx_dvbs2.py`.~~ Done.
 3. ~~**Wide mode** in the receiver firmware: packed 4-bit I/Q at 500 ksps for the default 333 kS/s.~~ Done.
-4. Better LDPC: the soft-decision `ldpc_tool` helper instead of leandvb's bit-flip decoder (about 9 dB).
+4. ~~Better LDPC: the soft-decision `ldpc_tool` helper instead of leandvb's bit-flip decoder.~~ Done: about 5 dB.
 5. A 667 ksps cs4 rate for 500 kS/s.
 6. *(Research)* Look for the same dump engine on the ESP32-C3.
 
@@ -164,7 +170,8 @@ gain, 4-bit quantisation costs about 0.07 dB at Es/N0 = 5 dB and 0.5 dB at 14 dB
 | | |
 |---|---|
 | `rx_dvbs2.py` | the receiver: espdr-rx or espdr.nb → leandvb → ffplay |
-| `tools/install.sh` | creates `.venv/` and builds leandvb |
+| `tools/install.sh` | creates `.venv/`, builds leandvb (with `tools/leandvb-ldpc-helper.patch`) and ldpc_tool |
+| `tools/leandvb-ldpc-helper.patch` | lets leandvb talk to ldpc_tool through ordinary pipes (partial reads and writes, pipe size) |
 | `tools/build-firmware.sh` | rebuilds `firmware/` from `esp32-sdr-trx/` (needs ESP-IDF v5.5) |
 | `tools/sim_wide.py` | offline test of resampling and 4-bit formats on a recording |
 | `tools/rtltcp_cat.py` | writes the I/Q of an rtl_tcp server to stdout (`rtltcp_cat.py FREQ_HZ [GAIN_DB]`) |
@@ -179,7 +186,8 @@ The receive path is built on [eSpDR](https://github.com/h0m3us3r/eSpDR) (h0m3us3
 [esp32-sdr-trx](https://github.com/jochenhammes/esp32-sdr-trx) (Jochen Hammes), both 0BSD. `esp32-sdr-trx/` and the
 firmware in `firmware/` are esp32-sdr-trx 1.0.0-rc4 with the cs4 change, under its 0BSD licence (`LICENSE`, `NOTICE`). The receiver
 image links Espressif's PHY library, and the bootloader and partition table come from ESP-IDF (Apache-2.0).
-DVB-S2 demodulation is [leansdr](https://github.com/pabr/leansdr) by pabr (GPL-3.0), downloaded and built by
+DVB-S2 demodulation is [leansdr](https://github.com/pabr/leansdr) by pabr (GPL-3.0), and LDPC decoding
+[Blockstream/LDPC](https://github.com/Blockstream/LDPC) (based on xdsopl/LDPC, 0BSD); both are downloaded and built by
 `tools/install.sh`. The transmitter is a fork of [SP8ESA/ESP32-DATV](https://github.com/SP8ESA/ESP32-DATV).
 
 Transmitting needs an amateur radio licence. Keep the level low and the antennas close on the bench.
@@ -213,8 +221,8 @@ indirip açın (ya da repoyu klonlayın). Klasörün içinde şunu çalıştır�
 tools/install.sh
 ```
 
-Betik `.venv/` içine `espdr-rx` aracını (alıcı firmware'i bunun içinde) kurar ve `leandvb`'yi `build/leansdr/` içine
-derler. Sisteme hiçbir şey kurmaz. Betiğin sonunda yazdırdığı udev kuralını bir kez kurmanız önerilir.
+Betik `.venv/` içine `espdr-rx` aracını (alıcı firmware'i bunun içinde) kurar, `leandvb`'yi `build/leansdr/` içine ve
+yumuşak kararlı LDPC çözücü `ldpc_tool`'u `build/LDPC/` içine derler. Sisteme hiçbir şey kurmaz. Betiğin sonunda yazdırdığı udev kuralını bir kez kurmanız önerilir.
 
 ### Alıcı firmware'ini ESP32-S3'e yükleme
 
@@ -259,7 +267,7 @@ dönmek için: `.venv/bin/python -m esptool --chip esp32s3 erase-flash`.
 Betik `espdr-rx`'i başlatır (`--wide` ile kartı `espdr.nb` üzerinden okur), `--freq` çevresinde sinyali arar, merkezine ayarlanır ve
 görüntüyü bir ffplay penceresinde açar. Her 5 saniyede hatasız ve hatalı çözülen çerçeve sayısını yazar. Ctrl-C ya da
 pencereyi kapatmak alımı bitirir. Seçenekler için yukarıdaki İngilizce tabloya bakın (`--gain`, `--record`,
-`--no-play`, `--stdout`, `--sr`, `--cr`, `--wide`).
+`--no-play`, `--stdout`, `--sr`, `--cr`, `--wide`, `--ldpc`).
 
 Masadaki örnekler: `./rx_dvbs2.py --freq 2301.5` vericiyi 2301.385 MHz'de buldu (−115 kHz, iki kartın kristal
 hataları toplamı) ve 125 kS/s'de 110 çerçeveden 109'unu çözdü. `./rx_dvbs2.py --wide --sr 333000 --freq 2301.5`
@@ -273,9 +281,12 @@ hataları toplamı) ve 125 kS/s'de 110 çerçeveden 109'unu çözdü. `./rx_dvbs
   çalıştırırken aynısını yapın.
 - **Görüntü seyrek yenileniyor:** bağımsız verici RAM'deki kısa bir test kartı döngüsünü yayınlıyor. Bu beklenen bir
   durum.
+- **LDPC:** `rx_dvbs2.py` leandvb'nin LDPC yardımcısı olarak [ldpc_tool](https://github.com/Blockstream/LDPC)
+  kullanır. Çevrimdışı testte Es/N0 ≈ 8 dB'ye kadar çözdü; leandvb'nin bit-flip çözücüsü 13–14 dB istiyordu, yani
+  yaklaşık **5 dB** daha fazla pay. 32 çerçeveyi birlikte çözdüğü için görüntü yaklaşık 3 s (333 kS/s) ya da 9 s
+  (125 kS/s) gecikmeli gelir.
 - **333 kS/s'de pay:** aynı güç 2.7 kat geniş banda yayıldığı için sinyal tabanın yalnızca 11–14 dB üstünde
-  (125 kS/s'de 25–30 dB). leandvb'nin bit-flip LDPC'si yaklaşık 12–14 dB istiyor; antenleri yakın tutun. Yol
-  haritasındaki yumuşak kararlı LDPC yaklaşık 9 dB kazandıracak.
+  (125 kS/s'de 25–30 dB). ldpc_tool ile birkaç dB pay kalıyor; antenleri yakın tutun.
 - **`--wide` ve espdr-rx:** ikisi de kartın native portunu kullanır. `--wide` öncesinde çalışan `espdr-rx`'i durdurun.
 
 Bu reponun kodu [BSD 3-Clause lisansı](LICENSE) ile yayınlanıyor. Kullanılan diğer projelerin lisansları ve

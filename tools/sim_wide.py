@@ -13,6 +13,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from fractions import Fraction
 
 import numpy as np
@@ -72,11 +74,50 @@ def decode(x, fs, args):
     x = np.concatenate([x] * args.repeat)  # the first pass includes the lock time
     data = (x / np.sqrt(np.mean(np.abs(x) ** 2)) * 0.25).astype(np.complex64).tobytes()
     cmd = [leandvb, "--f32", "--float-scale", "1", "-f", str(int(fs)), "--sr", str(int(args.sr)),
-           "--standard", "DVB-S2", "--const", "QPSK", "--cr", "3/4", "--ldpc-bf", "100", "--fastdrift", "-d"]
+           "--standard", "DVB-S2", "--const", "QPSK", "--cr", "3/4", "--fastdrift", "-d"]
+    cmd += ["--ldpc-helper", args.ldpc_helper] if args.ldpc_helper else ["--ldpc-bf", "100"]
+    # Accept only QPSK 3/4 normal frames: a corrupted PLS would otherwise start an ldpc_tool for a random
+    # modcod that waits forever for its batch of 32 frames.
+    cmd += ["--modcods", str(1 << 7), "--framesizes", "1"]
     cmd += args.extra.split() if args.extra else []
-    p = subprocess.run(cmd, input=data, capture_output=True, timeout=600)
-    err = p.stderr.decode(errors="ignore")
-    return err.count("_"), err.count("!"), err.count("LOCKED"), len(p.stdout) // 188
+    if not args.realtime:
+        p = subprocess.run(cmd, input=data, capture_output=True, timeout=600)
+        err, ts = p.stderr.decode(errors="ignore"), len(p.stdout) // 188
+    else:
+        # Feed at the sample rate, like the live receiver, then linger so that batches in flight
+        # (ldpc_tool decodes 32 frames at a time) come back before leandvb sees the end of its input.
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, errb = [], []
+        readers = [threading.Thread(target=lambda f=f, a=a: a.append(f.read()), daemon=True)
+                   for f, a in ((p.stdout, out), (p.stderr, errb))]
+        for t in readers:
+            t.start()
+        chunk = int(fs * 0.05) * 8  # 50 ms of cf32
+        t0 = time.monotonic()
+        for i in range(0, len(data), chunk):
+            try:
+                p.stdin.write(data[i:i + chunk])
+                p.stdin.flush()
+            except BrokenPipeError:
+                break  # leandvb ended; report what it decoded
+            lag = t0 + (i + chunk) / 8 / fs - time.monotonic()
+            if lag > 0:
+                time.sleep(lag)
+        time.sleep(args.linger)
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        for t in readers:
+            t.join(10)
+        err, ts = errb[0].decode(errors="ignore"), len(out[0]) // 188
+    # leandvb -d prints '_' per clean frame, '.' per frame corrected by BCH and '!' per failed one,
+    # without newlines; dots also occur in other lines, so only '_' and '!' are counted.
+    return err.count("_"), err.count("!"), err.count("LOCKED"), ts
 
 
 def main():
@@ -93,6 +134,9 @@ def main():
     ap.add_argument("--fade", type=float, default=0, help="multiply by a slow 0.5 Hz fade of this depth in dB")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--leandvb")
+    ap.add_argument("--ldpc-helper", help="soft-decision LDPC decoder (ldpc_tool) instead of the bit-flip one")
+    ap.add_argument("--realtime", action="store_true", help="feed leandvb at the sample rate, as in a live run")
+    ap.add_argument("--linger", type=float, default=15, help="with --realtime: seconds to wait at the end (default 15)")
     ap.add_argument("--extra", help="more leandvb options")
     args = ap.parse_args()
 
@@ -110,7 +154,7 @@ def main():
         x, clip = quantize(x, args.bits, args.scale, args.block, args.target)
     good, bad, locks, ts = decode(x, args.fs_out, args)
     total = good + bad
-    label = (f"fs {args.fs_out / 1e3:6.1f}k ({args.fs_out / args.sr:.2f} sps) bits {args.bits:2d} {args.scale:5s} "
+    label = (f"{'ldpc_tool' if args.ldpc_helper else 'bit-flip '} fs {args.fs_out / 1e3:6.1f}k ({args.fs_out / args.sr:.2f} sps) bits {args.bits:2d} {args.scale:5s} "
              f"Es/N0 {'-' if args.esn0 is None else args.esn0:>4} fade {args.fade:g} dB")
     print(f"{label}: frames ok {good:3d} bad {bad:3d} locks {locks} TS {ts:5d} clip {100 * clip:.2f}%", flush=True)
 

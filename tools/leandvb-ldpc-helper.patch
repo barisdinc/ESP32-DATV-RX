@@ -1,0 +1,64 @@
+diff --git a/src/leansdr/dvbs2.h b/src/leansdr/dvbs2.h
+index 3ee059a..6ea640a 100644
+--- a/src/leansdr/dvbs2.h
++++ b/src/leansdr/dvbs2.h
+@@ -20,6 +20,7 @@
+ #ifndef LEANSDR_DVBS2_H
+ #define LEANSDR_DVBS2_H
+ 
++#include <sys/select.h>
+ #include "leansdr/sdr.h"
+ #include "leansdr/softword.h"
+ #include "leansdr/dvb.h"
+@@ -2270,7 +2271,17 @@ namespace leansdr {
+ 	int nw = write(h->fd_tx, pin->bytes, iosize);
+ 	if ( nw<0 && errno==EWOULDBLOCK ) continue;
+ 	if ( nw < 0 ) fatal("write(LDPC helper");
+-	if ( nw != iosize ) fatal("partial write(LDPC helper)");
++	// A non-blocking pipe may take part of a frame: finish it blocking,
++	// the helper keeps reading.
++	for ( size_t done=nw; done<iosize; ) {
++	  fd_set w; FD_ZERO(&w); FD_SET(h->fd_tx, &w);
++	  if ( select(h->fd_tx+1, NULL, &w, NULL, NULL) < 0 && errno!=EINTR )
++	    fatal("select(LDPC helper)");
++	  int n = write(h->fd_tx, (const char*)pin->bytes+done, iosize-done);
++	  if ( n<0 && (errno==EWOULDBLOCK || errno==EINTR) ) continue;
++	  if ( n < 0 ) fatal("write(LDPC helper)");
++	  done += n;
++	}
+ 	helper_job *job = jobs.put();
+ 	job->pls = pin->pls;
+ 	job->h = h;
+@@ -2302,6 +2313,14 @@ namespace leansdr {
+       if ( pipe(tx) || pipe(rx) ) fatal("pipe");
+       // Size the pipes so that the helper never runs out of work to do.
+       int pipesize = 64800 * batch_size;
++      // Stay within the system's limit (often 1 MiB) instead of failing.
++      FILE *pms = fopen("/proc/sys/fs/pipe-max-size", "r");
++      if ( pms ) {
++	int maxsize;
++	if ( fscanf(pms, "%d", &maxsize)==1 && maxsize<pipesize )
++	  pipesize = maxsize;
++	fclose(pms);
++      }
+       if ( fcntl(tx[0], F_SETPIPE_SZ, pipesize) < 0 ||
+ 	   fcntl(rx[0], F_SETPIPE_SZ, pipesize) < 0 ||
+ 	   fcntl(tx[1], F_SETPIPE_SZ, pipesize) < 0 ||
+@@ -2344,9 +2363,14 @@ namespace leansdr {
+       // Read corrected frame from helper
+       const s2_pls *pls = &job->pls;
+       size_t iosize = (pls->framebits()/8) * sizeof(ldpc_buf[0]);
+-      int nr = read(job->h->fd_rx, ldpc_buf, iosize);
+-      if ( nr < 0 ) fatal("read(LDPC helper)");
+-      if ( nr != iosize ) fatal("partial read(LDPC helper)");
++      // A pipe returns what is there: read until the frame is complete.
++      for ( size_t done=0; done<iosize; ) {
++	int nr = read(job->h->fd_rx, (char*)ldpc_buf+done, iosize-done);
++	if ( nr<0 && errno==EINTR ) continue;
++	if ( nr < 0 ) fatal("read(LDPC helper)");
++	if ( nr == 0 ) fatal("LDPC helper closed its output");
++	done += nr;
++      }
+       --job->h->b_out;
+       // Decode BCH.
+       const modcod_info *mcinfo = check_modcod(job->pls.modcod);

@@ -35,6 +35,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FS = 333333  # espdr-rx --decim 3
 FS_WIDE = 500000  # espdr.nb --decim 2 --format cs4
 
+# DVB-S2 MODCOD numbers (EN 302 307-1, table 12), for leandvb's --modcods filter.
+MODCODS = {("QPSK", r): i + 1 for i, r in enumerate(("1/4", "1/3", "2/5", "1/2", "3/5", "2/3", "3/4", "4/5", "5/6", "8/9", "9/10"))}
+MODCODS.update({("8PSK", r): i + 12 for i, r in enumerate(("3/5", "2/3", "3/4", "5/6", "8/9", "9/10"))})
+MODCODS.update({("16APSK", r): i + 18 for i, r in enumerate(("2/3", "3/4", "4/5", "5/6", "8/9", "9/10"))})
+MODCODS.update({("32APSK", r): i + 24 for i, r in enumerate(("3/4", "4/5", "5/6", "8/9", "9/10"))})
+
 
 def find_tool(name, *candidates):
     for c in candidates:
@@ -251,10 +257,19 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--leandvb", help="path of leandvb (default: build/leansdr/src/apps/leandvb, then PATH)")
+    ap.add_argument("--ldpc", choices=("auto", "tool", "bitflip"), default="auto",
+                    help="LDPC decoder: ldpc_tool (soft decision, about 5 dB better, 32-frame latency) or leandvb's "
+                         "bit-flip one; auto takes ldpc_tool when it is installed")
     ap.add_argument("-v", "--verbose", action="store_true", help="show leandvb's messages")
     args = ap.parse_args()
 
     leandvb = find_tool("leandvb", args.leandvb, os.path.join(HERE, "build", "leansdr", "src", "apps", "leandvb"))
+    ldpc_tool = None if args.ldpc == "bitflip" else find_tool("ldpc_tool", os.path.join(HERE, "build", "LDPC", "ldpc_tool"))
+    if args.ldpc == "tool" and not ldpc_tool:
+        sys.exit("ldpc_tool not found: run tools/install.sh first")
+    modcod = MODCODS.get((args.const.upper(), args.cr))
+    if modcod is None:
+        sys.exit(f"unknown DVB-S2 modulation {args.const} {args.cr}")
     if not leandvb:
         sys.exit("leandvb not found: run tools/install.sh first, or give --leandvb")
     if not args.no_play and not (shutil.which("ffmpeg") and shutil.which("ffplay")):
@@ -282,7 +297,11 @@ def main():
                     break
 
         dvb = subprocess.Popen([leandvb] + src.leandvb_input() + ["--sr", str(int(args.sr)), "--standard", "DVB-S2",
-                                "--const", args.const, "--cr", args.cr, "--ldpc-bf", "100", "--fastdrift", "-d"],
+                                "--const", args.const, "--cr", args.cr, "--fastdrift", "-d",
+                                # only our MODCOD and normal frames: a corrupted PLS header would otherwise start an
+                                # ldpc_tool for a random MODCOD, which then waits for its batch of 32 frames forever
+                                "--modcods", str(1 << modcod), "--framesizes", "1"]
+                               + (["--ldpc-helper", ldpc_tool] if ldpc_tool else ["--ldpc-bf", "100"]),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         procs.append(dvb)
         sinks = []
@@ -330,8 +349,11 @@ def main():
         for fn in (pump_ts, pump_log):
             threading.Thread(target=fn, daemon=True).start()
 
-        log(f"receiving {freq / 1e6:.4f} MHz, {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB. "
-            "Ctrl-C ends.")
+        log(f"receiving {freq / 1e6:.4f} MHz, {args.sr / 1e3:g} kS/s {args.const} {args.cr}, gain {args.gain:g} dB, "
+            f"LDPC {'ldpc_tool' if ldpc_tool else 'bit-flip'}. Ctrl-C ends.")
+        if ldpc_tool:
+            log(f"ldpc_tool decodes 32 frames at a time: the first picture comes after about "
+                f"{32 * 33282 / args.sr:.0f} s")
         last = None
         while dvb.poll() is None and (args.no_play or procs[-1].poll() is None):
             time.sleep(5)
